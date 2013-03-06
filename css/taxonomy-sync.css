@@ -1,0 +1,5 @@
+.settings_page_taxonomy_sync-settings .chzn-container,
+.settings_page_taxonomy_sync-settings .chzn-drop,
+.settings_page_taxonomy_sync-settings .chzn-choices input[type=text] {
+	width: 350px !important;
+}
