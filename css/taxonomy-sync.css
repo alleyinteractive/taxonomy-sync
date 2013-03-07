@@ -3,3 +3,11 @@
 .settings_page_taxonomy_sync-settings .chzn-choices input[type=text] {
 	width: 350px !important;
 }
+
+#taxonomy-sync-full-sync-wrapper p.submit {
+	padding: 0px;
+}
+
+#taxonomy-sync-full-sync-not-available {
+	display: none;
+}
