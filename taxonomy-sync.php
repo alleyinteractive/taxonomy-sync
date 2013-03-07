@@ -6,7 +6,7 @@
  
 /*
  Plugin Name: Taxonomy Sync
- Description: Synchronizes taxonomies between two WordPress sites. It can handle
+ Description: Synchronizes taxonomies between two WordPress sites.
  Author: Bradford Campeau-Laurion
  Version: 0.1
  Author URI: http://alleyinteractive.com
@@ -46,7 +46,7 @@ class Taxonomy_Sync {
 	 */
 	public function __construct() {
 		register_activation_hook( __FILE__, array( $this, 'dependencies' ) );
-		add_action( 'init', array( &$this, 'setup_plugin' ) );
+		add_action( 'init', array( &$this, 'setup_plugin' ), 100 );
 		
 		// Handle AJAX requests
 		add_action( 'wp_ajax_taxonomy_sync_full_sync', array( $this, 'do_full_sync' ) );
@@ -97,8 +97,13 @@ class Taxonomy_Sync {
 			add_action( 'admin_menu', array( &$this, 'register_settings_page' ) );
 			add_action( 'admin_notices', array( $this, 'settings_notice' ) );
 			add_action( 'admin_enqueue_scripts', array( $this, 'enqueue_scripts' ) );
-			add_action( 'created_term', array( $this, 'sync_term' ), 100, 3 );
-			add_action( 'edited_term', array( $this, 'sync_term' ), 100, 3 );
+			
+			// Only add sync actions for master sites
+			if( $this->settings['mode'] == 'master' ) {
+				add_action( 'created_term', array( $this, 'sync_term' ), 100, 3 );
+				add_action( 'edited_term', array( $this, 'sync_term' ), 100, 3 );
+				add_action( 'delete_term', array( $this, 'sync_term' ), 100, 4 );
+			}
 		}
 		
 		// If this is a slave site, check if the path callback for receiving a term has been called
@@ -132,7 +137,10 @@ class Taxonomy_Sync {
 		wp_enqueue_style( 'chosen_css', $this->get_baseurl() . 'js/chosen/chosen.css' );
 		
 		// Create a nonce and message for AJAX actions and localize the script
-		wp_localize_script( 'taxonomy_sync_script', $this->prefix . '_data', array( 'nonce' => wp_create_nonce( $this->prefix . '_full_sync_nonce' ) ) );
+		wp_localize_script( 'taxonomy_sync_script', $this->prefix . '_data', array( 
+			'nonce' => wp_create_nonce( $this->prefix . '_full_sync_nonce' ),
+			'running_message' => __( 'Sync running' )
+		) );
 	}
 
 	/**
@@ -367,7 +375,7 @@ class Taxonomy_Sync {
 					//wp_nonce_field( $this->prefix . '_full_sync_nonce' );
 					submit_button( __( 'Run Full Synchronization' ), 'secondary', $this->prefix . '_full_sync_button' );
 					?>
-					<p id="taxonomy-sync-full-sync-message"><?php _e( 'This will sync all terms in the selected taxonomies to the slave site.' ) ?></p>
+					<p id="taxonomy-sync-full-sync-message"><?php _e( 'This will sync all terms in the selected taxonomies to the slave site. Note that you should probably run this <b>twice</b> the first time in order to correctly match all parent and child terms.' ) ?></p>
 					</div>
 					<div id="taxonomy-sync-full-sync-not-available">
 					<?php _e( 'Full sync can only be run from the master site.' ) ?>
@@ -470,17 +478,25 @@ class Taxonomy_Sync {
 	 *
 	 * @return void
 	 */
-	function sync_term( $term_id, $tt_id, $taxonomy ) {
+	function sync_term( $term_id, $tt_id, $taxonomy, $deleted_term=null ) {
 		// If the taxonomy is not one that we are syncing, just exit
 		if( !in_array( $taxonomy, $this->settings['taxonomies'] ) )
 			return;
-	
-		// Get the full term object
-		$term = get_term( intval( $term_id ), $taxonomy );
+		
+		// If deleted_term is set, we already have the term object
+		// Otherwise, get the full term object
+		if( $deleted_term == null ) {
+			$action = 'update';
+			$term = get_term( intval( $term_id ), $taxonomy );
+		} else {
+			$action = 'delete';
+			$term = $deleted_term;
+		}
 		
 		// Assemble the post vars
 		$post_vars = array(
 			'key' => $this->settings['key'],
+			'action' => $action,
 			'taxonomy' => $taxonomy,
 			'term' => json_encode( $term )
 		);
@@ -507,7 +523,7 @@ class Taxonomy_Sync {
 			)
 		);
 	
-		if ( is_wp_error( $response ) || !is_numeric( $response['body'] ) ) {
+		if ( ( is_wp_error( $response ) || !is_numeric( $response['body'] ) ) && !empty( $response['body'] ) ) {
 			$error_message = ( is_wp_error( $response ) ) ? $response->get_error_message() : $response['body'];
 			$this->error( $error_message );
 			return false;
@@ -545,7 +561,7 @@ class Taxonomy_Sync {
 			die();
 		}
 		
-		$term = json_decode( $_POST['term'] );
+		$term = json_decode( stripslashes( $_POST['term'] ) );
 		if( $term == null ) {
 			_e( 'The term object was invalid.' );
 			die();
@@ -555,53 +571,76 @@ class Taxonomy_Sync {
 		// We will store the unique ID from the remote system as term meta in order to determine if this term already exists
 		$term_id = $this->get_term_id_from_master_id( $term->term_id );
 		
-		// Get the insert/update args from the term object. Remove/reset args that may be invalid on the slave site.
-		$term_args = array(
-			'name' => $term->name,
-			'slug' => $term->slug,
-			'description' => $term->description
-		);
+		// Determine if this is an insert/update or delete action
 		
-		// See if there is a parent ID set and find it on the slave site
-		if( !empty( $term->parent ) ) {
-			$parent_id = $this->get_term_id_from_master_id( $term->parent );
-			if( !empty( $parent_id ) )
-				$term_args['parent'] = $parent_id;
-		}
-				
-		// If the term_id is not set, insert. Otherwise update.
-		if( empty( $term_id ) ) {
-			$result = wp_insert_term( $term->name, $term->taxonomy, $term_args );
-
-			if( $result ) {
-				// Set the master ID for future updates
-				tm_update_term_meta( $result['term_id'], $this->master_id_key, $term->term_id );
-				
-				// Add an action for themes and plugins to hook into 
-				do_action( $this->prefix . '_created_term', $result['term_id'], $result['term_taxonomy_id'], $term->taxonomy );
+		if( $_POST['action'] == 'delete' ) {
+			// Remove all term meta, if necessary
+			if( class_exists( 'Term_Meta' ) && function_exists( 'tm_get_term_meta' ) && array_key_exists( 'term_meta', $_POST ) ) {
+				$term_metas = json_decode( stripslashes( $_POST['term_meta'] ) );
+				foreach( $term_metas as $term_meta_key => $term_meta_value ) {
+					tm_delete_term_meta( $term_id, $term_meta_key );
+				}
 			}
-		} else {
-			$result = wp_update_term( $term_id, $term->taxonomy, $term_args );
+			tm_delete_term_meta( $term_id, $this->master_id_key );
 			
-			if( $result ) {
-				// Add an action for themes and plugins to hook into 
-				do_action( $this->prefix . '_edited_term', $result['term_id'], $result['term_taxonomy_id'], $term->taxonomy );
+			// Remove the term
+			$result = wp_delete_term( $term_id, $term->taxonomy );
+			
+			// If there was an issue deleting the term, return it
+			if( is_wp_error( $result ) )
+				echo $result->get_error_message();
+		
+		} else { 
+			
+			// Get the insert/update args from the term object. Remove/reset args that may be invalid on the slave site.
+			$term_args = array(
+				'name' => $term->name,
+				'slug' => $term->slug,
+				'description' => $term->description
+			);
+			
+			// See if there is a parent ID set and find it on the slave site
+			if( !empty( $term->parent ) ) {
+				$parent_id = $this->get_term_id_from_master_id( $term->parent );
+				if( !empty( $parent_id ) )
+					$term_args['parent'] = $parent_id;
 			}
-		}
-		
-		// If there was an issue updating the term, die with the error message
-		if( is_wp_error( $result ) ) {
-			echo $result->get_error_message();
-			die();
-		}
-		
-		// Add compatibility with the WordPress Term Meta plugin
-		if( class_exists( 'Term_Meta' ) && function_exists( 'tm_get_term_meta' ) && array_key_exists( 'term_meta', $_POST ) ) {
-			$term_metas = json_decode( $_POST['term_meta'] );
-			foreach( $term_metas as $term_meta_key => $term_meta_value ) {
-				// Add a filter on the term meta value to allow manipulation by themes and plugins
-				$term_meta_value = apply_filters( $this->prefix . '_term_meta_value', $term_meta_value, $term_meta_key );
-				tm_update_term_meta( $term_id, $term_meta_key, $term_meta_value );
+					
+			// If the term_id is not set, insert. Otherwise update.
+			if( empty( $term_id ) ) {
+				unset( $term_args['name'] );
+				$result = wp_insert_term( $term->name, $term->taxonomy, $term_args );
+	
+				if( !is_wp_error( $result ) ) {
+					// Set the master ID for future updates
+					tm_update_term_meta( $result['term_id'], $this->master_id_key, $term->term_id );
+					
+					// Add an action for themes and plugins to hook into 
+					do_action( $this->prefix . '_created_term', $result['term_id'], $result['term_taxonomy_id'], $term->taxonomy );
+				}
+			} else {
+				$result = wp_update_term( $term_id, $term->taxonomy, $term_args );
+				
+				if( !is_wp_error( $result ) ) {
+					// Add an action for themes and plugins to hook into 
+					do_action( $this->prefix . '_edited_term', $result['term_id'], $result['term_taxonomy_id'], $term->taxonomy );
+				}
+			}
+			
+			// If there was an issue updating the term, die with the error message
+			if( is_wp_error( $result ) ) {
+				echo $result->get_error_message();
+				die();
+			}
+			
+			// Add compatibility with the WordPress Term Meta plugin
+			if( class_exists( 'Term_Meta' ) && function_exists( 'tm_get_term_meta' ) && array_key_exists( 'term_meta', $_POST ) ) {
+				$term_metas = json_decode( stripslashes( $_POST['term_meta'] ) );
+				foreach( $term_metas as $term_meta_key => $term_meta_value ) {
+					// Add a filter on the term meta value to allow manipulation by themes and plugins
+					$term_meta_value = apply_filters( $this->prefix . '_term_meta_value', $term_meta_value[0], $term_meta_key );
+					tm_update_term_meta( $result['term_id'], $term_meta_key, $term_meta_value );
+				}
 			}
 		}
 		
@@ -659,29 +698,30 @@ class Taxonomy_Sync {
 	 * @return void
 	 */
 	function do_full_sync() {
-		error_log( "yo" );
+		if( !ini_get('safe_mode') ) ini_set( 'max_execution_time', 10000 );
+		
 		// Check the nonce before we do anything
 		check_ajax_referer( $this->prefix . '_full_sync_nonce', $this->prefix . '_full_sync_nonce' );
-		
+
 		// If this is a slave site, do not allow this to be run
 		if( $this->settings['mode'] != 'master' ) {
 			_e( 'Cannot run full synchronization since this is not the master site.' );
 			die();
 		}
-		
+
 		// If remote URL is not set, this cannot be run
 		if( empty( $this->settings['remote_url'] ) ) {
 			_e( 'Cannot run full synchronization since no remote URL is defined for the slave site.' );
 			die();
 		}
-		
+
 		// Get all terms for each defined taxonomy. Exit if no taxonomies are defined.
 		$taxonomies = $this->settings['taxonomies'];
 		if( empty( $taxonomies ) ) {
 			_e( 'Cannot run full synchronization. No taxonomies are defined.' );
 			die();
 		}
-		
+
 		$timestamp_start = microtime( true );
 		$sync_status = "successfully";
 		

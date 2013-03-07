@@ -23,6 +23,7 @@ $( document ).ready( function() {
 		// Send the post request
 		// Get all current related links for the post
 		var start_time = new Date().getTime();
+		$('#taxonomy-sync-full-sync-message').html( taxonomy_sync_data.running_message + "..." );
 		$.post( ajaxurl, { action: 'taxonomy_sync_full_sync', taxonomy_sync_full_sync_nonce: taxonomy_sync_data.nonce }, function ( response ) {
 			// Just display the response. It will explain what happened.
 			$('#taxonomy-sync-full-sync-message').html( response );
