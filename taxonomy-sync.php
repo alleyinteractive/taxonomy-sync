@@ -341,7 +341,7 @@ class Taxonomy_Sync {
 		<?php
 		// Initialize chosen.js for this field
 		echo sprintf(
-			'<script type="text/javascript"> $("#%s").chosen()</script>',
+			'<script type="text/javascript"> ( function( $ ) { $("#%s").chosen(); } )( jQuery );</script>',
 			$this->prefix . "-settings-taxonomies"
 		);
 	
